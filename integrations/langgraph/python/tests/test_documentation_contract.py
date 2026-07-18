@@ -20,6 +20,26 @@ class TestDocumentationContract(unittest.TestCase):
         self.assertNotIn("default off", langgraph_row)
         self.assertNotIn("emitted by default", langgraph_row)
 
+    def test_readme_documents_claim_retry_and_deployment_boundaries(self):
+        repository_root = Path(__file__).resolve().parents[4]
+        text = (
+            repository_root / "integrations/langgraph/python/README.md"
+        ).read_text()
+        normalized = " ".join(text.split())
+
+        self.assertIn("claim is not released", normalized)
+        self.assertIn(
+            "cannot be retried after cancellation or disconnect",
+            normalized,
+        )
+        self.assertIn("bounded at 4096 live claims", normalized)
+        self.assertIn(
+            "fail closed rather than evicting replay protection",
+            normalized,
+        )
+        self.assertIn("one FastAPI async worker/event loop", normalized)
+        self.assertIn("durable atomic claim/CAS", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

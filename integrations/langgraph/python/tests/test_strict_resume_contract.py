@@ -4,12 +4,13 @@ import unittest
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from ag_ui.core import CustomEvent, EventType, ResumeEntry, UserMessage
+from ag_ui_langgraph.agent import _ResumeClaimRegistry
 
 from tests._helpers import make_agent
 
@@ -205,6 +206,27 @@ class TestStrictResumeContract(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
                 agent.graph.astream_events.assert_not_called()
 
+    async def test_expiry_exactly_equal_to_frozen_utc_now_fails_closed(self):
+        frozen_now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen_now if tz is not None else frozen_now.replace(tzinfo=None)
+
+        agent = make_agent()
+        resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload=True)]
+
+        with patch("ag_ui_langgraph.agent.datetime", FrozenDateTime):
+            result = await _prepare(
+                agent,
+                _state_with_expiry(frozen_now.isoformat()),
+                _input(resume=resume),
+            )
+
+        self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
+        agent.graph.astream_events.assert_not_called()
+
     async def test_malformed_or_naive_expiry_fails_closed(self):
         for expires_at in ("not-a-timestamp", "2030-01-01T00:00:00"):
             with self.subTest(expires_at=expires_at):
@@ -221,6 +243,22 @@ class TestStrictResumeContract(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
                 agent.graph.astream_events.assert_not_called()
+
+    async def test_claim_capacity_exhaustion_fails_closed_without_dispatch(self):
+        agent = make_agent()
+        registry = _ResumeClaimRegistry(max_claims=1)
+        registry.try_claim(("other-thread", "checkpoint", ("other-interrupt",)))
+        agent._resume_claim_registry = registry
+        resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload=True)]
+
+        result = await _prepare(agent, _state("int-1"), _input(resume=resume))
+
+        self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
+        self.assertIn(
+            "capacity",
+            result["events_to_dispatch"][0].message,
+        )
+        agent.graph.astream_events.assert_not_called()
 
     async def test_partial_resume_is_run_error_without_graph_dispatch(self):
         agent = make_agent()

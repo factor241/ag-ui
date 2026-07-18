@@ -1,12 +1,15 @@
 import asyncio
+from collections import OrderedDict
 import logging
 import re
 import uuid
 import json
+import threading
 import warnings
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional, List, Any, Union, AsyncGenerator, Generator, Literal, Dict, TypedDict
 from typing_extensions import NotRequired, Self
 import inspect
@@ -111,6 +114,50 @@ logger = logging.getLogger(__name__)
 
 ROOT_SUBGRAPH_NAME = "root"
 
+_ResumeFingerprint = tuple[str, str, tuple[str, ...]]
+
+
+def _structural_copy_config(value: Any, memo: Optional[Dict[int, Any]] = None) -> Any:
+    """Copy mutable containers while retaining opaque runtime leaf objects.
+
+    RunnableConfig callbacks and runtime resources commonly contain locks,
+    clients, or managers that cannot be deep-copied and are intentionally
+    shared. Request-owned dict/list/set containers are recursively isolated.
+    """
+    if memo is None:
+        memo = {}
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+    if isinstance(value, dict):
+        copied: dict = {}
+        memo[value_id] = copied
+        copied.update(
+            (key, _structural_copy_config(item, memo))
+            for key, item in value.items()
+        )
+        return copied
+    if isinstance(value, list):
+        copied_list: list = []
+        memo[value_id] = copied_list
+        copied_list.extend(_structural_copy_config(item, memo) for item in value)
+        return copied_list
+    if isinstance(value, tuple):
+        copied_tuple = tuple(_structural_copy_config(item, memo) for item in value)
+        memo[value_id] = copied_tuple
+        return copied_tuple
+    if isinstance(value, set):
+        copied_set = {_structural_copy_config(item, memo) for item in value}
+        memo[value_id] = copied_set
+        return copied_set
+    if isinstance(value, frozenset):
+        copied_frozenset = frozenset(
+            _structural_copy_config(item, memo) for item in value
+        )
+        memo[value_id] = copied_frozenset
+        return copied_frozenset
+    return value
+
 
 class _ThreadLockRecord:
     """One in-process thread lock plus its current owner/waiter count."""
@@ -147,6 +194,55 @@ class _ThreadLockRegistry:
             record.users -= 1
             if record.users == 0 and self._records.get(thread_id) is record:
                 del self._records[thread_id]
+
+
+class _ResumeClaimStatus(str, Enum):
+    CLAIMED = "claimed"
+    DUPLICATE = "duplicate"
+    CAPACITY_EXCEEDED = "capacity_exceeded"
+
+
+class _ResumeClaimRegistry:
+    """Bounded process-local claims retained across response cancellation.
+
+    Claims are LRU-ordered. A newly observed fingerprint for the same thread
+    safely retires that thread's older claim because strict validation always
+    targets the current checkpoint. Claims belonging to other current threads
+    are never evicted under memory pressure; new dispatches fail closed once
+    capacity is exhausted.
+    """
+
+    def __init__(self, *, max_claims: int = 4096) -> None:
+        if max_claims <= 0:
+            raise ValueError("max_claims must be positive")
+        self._max_claims = max_claims
+        self._claims: OrderedDict[_ResumeFingerprint, None] = OrderedDict()
+        self._guard = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._guard:
+            return len(self._claims)
+
+    def try_claim(self, fingerprint: _ResumeFingerprint) -> _ResumeClaimStatus:
+        with self._guard:
+            if fingerprint in self._claims:
+                self._claims.move_to_end(fingerprint)
+                return _ResumeClaimStatus.DUPLICATE
+
+            thread_id = fingerprint[0]
+            retired = [
+                existing
+                for existing in self._claims
+                if existing[0] == thread_id
+            ]
+            for existing in retired:
+                del self._claims[existing]
+
+            if len(self._claims) >= self._max_claims:
+                return _ResumeClaimStatus.CAPACITY_EXCEEDED
+
+            self._claims[fingerprint] = None
+            return _ResumeClaimStatus.CLAIMED
 
 
 class PreparedStream(TypedDict):
@@ -191,6 +287,7 @@ class LangGraphAgent:
         }
         self.current_subgraph = ROOT_SUBGRAPH_NAME
         self._thread_lock_registry = _ThreadLockRegistry()
+        self._resume_claim_registry = _ResumeClaimRegistry()
 
         if (
             enable_legacy_on_interrupt_event is not None
@@ -214,12 +311,13 @@ class LangGraphAgent:
         Subclasses that add required __init__ parameters must override clone()
         to pass those parameters through.
         """
+        config = _structural_copy_config(self.config) if self.config else None
         try:
             cloned = type(self)(
                 name=self.name,
                 graph=self.graph,
                 description=self.description,
-                config=deepcopy(self.config) if self.config else None,
+                config=config,
             )
         except TypeError as exc:
             raise TypeError(
@@ -228,8 +326,9 @@ class LangGraphAgent:
                 f"keyword arguments: {exc}"
             ) from exc
         # Clones isolate request state and nested configuration, but they must
-        # share the template's lock registry to serialize the same thread.
+        # share the template's replay guards to serialize and claim the thread.
         cloned._thread_lock_registry = self._thread_lock_registry
+        cloned._resume_claim_registry = self._resume_claim_registry
         return cloned
 
     def _dispatch_event(self, event: ProcessedEvents) -> ProcessedEvents:
@@ -601,6 +700,22 @@ class LangGraphAgent:
             )
             if validation_error is not None:
                 return self._invalid_resume_response(validation_error)
+            fingerprint = self._resume_fingerprint(
+                thread_id=thread_id,
+                agent_state=agent_state,
+                open_interrupts=agui_interrupts,
+            )
+            claim_status = self._resume_claim_registry.try_claim(fingerprint)
+            if claim_status == _ResumeClaimStatus.DUPLICATE:
+                return self._invalid_resume_response(
+                    "Invalid resume request: this checkpoint interrupt set "
+                    "has already been claimed."
+                )
+            if claim_status == _ResumeClaimStatus.CAPACITY_EXCEEDED:
+                return self._invalid_resume_response(
+                    "Invalid resume request: process-local resume claim capacity "
+                    "is exhausted; refusing dispatch fail-closed."
+                )
 
         # Interrupt resume must be checked BEFORE the regenerate heuristic.
         # When an interrupt is active the checkpoint contains an AI message
@@ -1179,6 +1294,27 @@ class LangGraphAgent:
     ) -> Command:
         """Build one native LangGraph command keyed by interrupt ID."""
         return Command(resume={entry.interrupt_id: entry.payload for entry in entries})
+
+    @staticmethod
+    def _resume_fingerprint(
+        *,
+        thread_id: Optional[str],
+        agent_state: State,
+        open_interrupts: List[AGUIInterrupt],
+    ) -> _ResumeFingerprint:
+        snapshot_config = getattr(agent_state, "config", None)
+        checkpoint_id = None
+        if isinstance(snapshot_config, dict):
+            configurable = snapshot_config.get("configurable") or {}
+            if isinstance(configurable, dict):
+                checkpoint_id = configurable.get("checkpoint_id")
+        if not isinstance(checkpoint_id, (str, int, float)):
+            checkpoint_id = "<unknown-checkpoint>"
+        return (
+            thread_id or "<unknown-thread>",
+            str(checkpoint_id),
+            tuple(sorted(interrupt.id for interrupt in open_interrupts)),
+        )
 
     @staticmethod
     def _invalid_resume_response(message: str) -> PreparedStream:

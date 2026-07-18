@@ -53,6 +53,8 @@ class RecordingAgent:
         self.label = label
         self.name = "recording-agent"
         self.bound_actor = None
+        self._thread_lock_registry = object()
+        self._resume_claim_registry = object()
 
     def clone(self):
         self.calls.append(("clone", self.label))
@@ -83,6 +85,37 @@ class TestEndpointDispatchHooks(unittest.TestCase):
         self.assertEqual(
             signature.parameters["before_dispatch"].kind,
             inspect.Parameter.KEYWORD_ONLY,
+        )
+
+    def test_openapi_preserves_run_agent_input_request_schema(self):
+        app = FastAPI()
+        add_langgraph_fastapi_endpoint(
+            app,
+            RecordingAgent([]),
+            "/agent",
+        )
+
+        schema = app.openapi()
+        request_schema = schema["paths"]["/agent"]["post"]["requestBody"][
+            "content"
+        ]["application/json"]["schema"]
+
+        self.assertEqual(
+            request_schema,
+            {"$ref": "#/components/schemas/RunAgentInput"},
+        )
+        run_input_schema = schema["components"]["schemas"]["RunAgentInput"]
+        self.assertIn("resume", run_input_schema["properties"])
+        self.assertTrue(
+            {
+                "threadId",
+                "runId",
+                "state",
+                "messages",
+                "tools",
+                "context",
+                "forwardedProps",
+            }.issubset(run_input_schema["required"])
         )
 
     def test_dependency_deny_happens_before_clone_and_run(self):

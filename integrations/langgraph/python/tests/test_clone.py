@@ -2,7 +2,10 @@
 
 import unittest
 import warnings
+import threading
 from unittest.mock import MagicMock
+
+from langchain_core.callbacks import BaseCallbackHandler, CallbackManager
 
 from ag_ui_langgraph import LangGraphAgent
 
@@ -70,6 +73,55 @@ class TestClone(unittest.TestCase):
         self.assertEqual(agent.config["configurable"]["request_context"]["actor"], "template")
         self.assertEqual(second.config["configurable"]["request_context"]["actor"], "template")
         self.assertIsNot(first.config["configurable"], agent.config["configurable"])
+
+    def test_clone_structurally_copies_containers_but_preserves_opaque_leaves(self):
+        class NonCopyableCallback:
+            def __deepcopy__(self, memo):
+                raise TypeError("callback must not be deep-copied")
+
+        callback = NonCopyableCallback()
+        runtime_lock = threading.Lock()
+        config = {
+            "callbacks": [callback],
+            "configurable": {
+                "runtime": (runtime_lock, {"labels": ["template"]}),
+            },
+        }
+        agent = LangGraphAgent(name="test", graph=self._make_graph(), config=config)
+
+        cloned = agent.clone()
+
+        self.assertIs(cloned.config["callbacks"][0], callback)
+        self.assertIs(cloned.config["configurable"]["runtime"][0], runtime_lock)
+        self.assertIsNot(cloned.config, agent.config)
+        self.assertIsNot(cloned.config["callbacks"], agent.config["callbacks"])
+        self.assertIsNot(
+            cloned.config["configurable"]["runtime"][1],
+            agent.config["configurable"]["runtime"][1],
+        )
+
+    def test_clone_preserves_real_callback_manager_with_noncopyable_handler(self):
+        class LockedHandler(BaseCallbackHandler):
+            def __init__(self):
+                self.runtime_lock = threading.Lock()
+
+        handler = LockedHandler()
+        callback_manager = CallbackManager([handler])
+        agent = LangGraphAgent(
+            name="test",
+            graph=self._make_graph(),
+            config={
+                "callbacks": callback_manager,
+                "configurable": {"request_context": {"actor": "template"}},
+            },
+        )
+
+        cloned = agent.clone()
+
+        self.assertIs(cloned.config["callbacks"], callback_manager)
+        self.assertIs(callback_manager.handlers[0], handler)
+        self.assertIs(handler.runtime_lock, callback_manager.handlers[0].runtime_lock)
+        self.assertIsNot(cloned.config["configurable"], agent.config["configurable"])
 
     def test_clone_subclass_has_overridden_methods(self):
         """clone() of a subclass should have the subclass's methods."""

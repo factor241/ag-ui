@@ -17,7 +17,6 @@ from .types import (
     LangGraphReasoning,
 )
 from .utils import json_safe_stringify, make_json_safe
-from .endpoint import add_langgraph_fastapi_endpoint
 from .middlewares.state_streaming import StateStreamingMiddleware, StateItem
 from .a2ui_tool import (
     get_a2ui_tools,
@@ -55,3 +54,20 @@ __all__ = [
     "json_safe_stringify",
     "make_json_safe"
 ]
+
+
+def __getattr__(name: str):
+    """Load the optional FastAPI endpoint export only when requested."""
+    if name != "add_langgraph_fastapi_endpoint":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        from .endpoint import add_langgraph_fastapi_endpoint
+    except ModuleNotFoundError as exc:
+        if exc.name == "fastapi" or (exc.name or "").startswith("fastapi."):
+            raise ImportError(
+                "add_langgraph_fastapi_endpoint requires the optional "
+                "FastAPI dependencies; install ag-ui-langgraph[fastapi]."
+            ) from exc
+        raise
+    globals()[name] = add_langgraph_fastapi_endpoint
+    return add_langgraph_fastapi_endpoint

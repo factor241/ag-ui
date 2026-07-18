@@ -10,6 +10,13 @@ Provides a complete Python integration for LangGraph agents with the AG-UI proto
 pip install ag-ui-langgraph
 ```
 
+The core agent import does not require FastAPI. Install the endpoint extra when
+registering the HTTP/SSE integration:
+
+```bash
+pip install 'ag-ui-langgraph[fastapi]'
+```
+
 ## Usage
 
 ```python
@@ -111,12 +118,26 @@ ISO-8601 timestamp. Expired or malformed timestamps fail closed. A
 `status="cancelled"` entry must omit `payload` or set it to `None`; every
 non-null payload, including falsey values, is rejected.
 
-Clones created from the same agent template share a per-thread `asyncio` lock.
-The lock covers checkpoint re-read, validation, graph dispatch, and complete
-stream consumption, so two concurrent resumes in one FastAPI backend process
-cannot both execute. This guarantee is deliberately process-local; deployments
-with multiple workers or hosts require durable cross-process coordination in
-their checkpoint/runtime layer.
+The FastAPI registrar forces every request clone, including clones returned by
+subclass overrides, to use the template's replay coordinator. A per-thread
+`asyncio` lock covers checkpoint re-read, validation, graph dispatch, and stream
+consumption. Before dispatch, the coordinator persistently claims the exact
+`(thread_id, checkpoint_id, open_interrupt_ids)` fingerprint. That claim is not
+released when an SSE client disconnects or its response task is cancelled, so a
+waiting duplicate fails with `RUN_ERROR` even if the checkpoint still appears
+open.
+
+This intentionally favors duplicate prevention over transparent retry: once a
+valid resume is claimed in the process, that same checkpoint/interrupt set
+cannot be retried after cancellation or disconnect. A newer checkpoint for the
+same thread safely retires its older claim. The LRU-ordered registry is bounded
+at 4096 live claims; if claims from other still-current threads fill it, new
+resumes fail closed rather than evicting replay protection.
+
+The guarantee covers one FastAPI async worker/event loop. Process restart clears
+in-memory claims, and multiple workers, event loops, or hosts do not share them;
+those deployments require a durable atomic claim/CAS in their shared
+checkpoint/runtime layer.
 
 The deprecated constructor arguments `enable_legacy_on_interrupt_event` and
 `emit_interrupt_outcome` remain accepted for source compatibility and emit a
