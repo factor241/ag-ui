@@ -48,6 +48,7 @@ def _make_input(messages, thread_id="t1", forwarded_props=None):
     inp.tools = []
     inp.context = []
     inp.forwarded_props = forwarded_props or {}
+    inp.resume = None
     return inp
 
 

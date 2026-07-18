@@ -18,8 +18,7 @@ def make_agent(subgraph_names: Optional[Iterable[str]] = None, **agent_kwargs) -
     """Return a ``LangGraphAgent`` backed by a mock graph; each name in
     ``subgraph_names`` becomes a node whose ``bound`` is a
     ``CompiledStateGraph`` mock (how the agent detects subgraphs at
-    construction). Extra keyword arguments are forwarded to ``LangGraphAgent``
-    (e.g. ``emit_interrupt_outcome=True``)."""
+    construction). Extra keyword arguments are forwarded to ``LangGraphAgent``."""
     graph = MagicMock(spec=CompiledStateGraph)
     graph.config_specs = []
     nodes = {}

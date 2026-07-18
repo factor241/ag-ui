@@ -68,7 +68,3 @@ def lg_interrupt_to_agui(lg: LangGraphInterrupt) -> AGUIInterrupt:
 
 def lg_interrupts_to_agui(items) -> List[AGUIInterrupt]:
     return [lg_interrupt_to_agui(i) for i in items]
-
-
-DEFAULT_RESUME_SENTINEL_CANCELLED = "__agui_cancelled__"
-DEFAULT_RESUME_SENTINEL_MAP = "__agui_resume_map__"

@@ -75,7 +75,7 @@ from ag_ui.core import (
     ReasoningEndEvent,
     ReasoningEncryptedValueEvent,
 )
-from .interrupts import lg_interrupts_to_agui, DEFAULT_RESUME_SENTINEL_CANCELLED, DEFAULT_RESUME_SENTINEL_MAP
+from .interrupts import lg_interrupts_to_agui
 from ag_ui.encoder import EventEncoder
 from ag_ui_a2ui_toolkit import split_a2ui_schema_context
 
@@ -124,18 +124,11 @@ class PreparedStream(TypedDict):
     events_to_dispatch: NotRequired[Optional[List[ProcessedEvents]]]
 
 class LangGraphAgent:
-    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None, enable_legacy_on_interrupt_event: bool = True, emit_interrupt_outcome: bool = False):
+    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None):
         self.name = name
         self.description = description
         self.graph = graph
         self.config = config or {}
-        self.enable_legacy_on_interrupt_event = enable_legacy_on_interrupt_event
-        # Opt-in: terminate interrupted runs with the AG-UI structured outcome
-        # RunFinishedEvent(outcome={"type": "interrupt", ...}). Default False so
-        # released clients that resume via forwardedProps.command.resume keep
-        # working until they adopt RunAgentInput.resume[] (the structured outcome
-        # makes them stop sending a resume directive). See _emit_interrupt_finish.
-        self.emit_interrupt_outcome = emit_interrupt_outcome
         self.messages_in_process: MessagesInProgressRecord = {}
         self.active_run: Optional[RunMetadata] = None
         self.constant_schema_keys = ['messages', 'tools']
@@ -161,8 +154,6 @@ class LangGraphAgent:
                 graph=self.graph,
                 description=self.description,
                 config=dict(self.config) if self.config else None,
-                enable_legacy_on_interrupt_event=self.enable_legacy_on_interrupt_event,
-                emit_interrupt_outcome=self.emit_interrupt_outcome,
             )
         except TypeError as exc:
             raise TypeError(
@@ -218,31 +209,13 @@ class LangGraphAgent:
 
             agent_state = await self.graph.aget_state(config)
             command_input = forwarded_props.get('command', {}) if forwarded_props else {}
-            legacy_command_resume = (
-                command_input.get('resume', None) if isinstance(command_input, dict) else None
+            legacy_resume_requested = (
+                isinstance(command_input, dict) and 'resume' in command_input
             )
-            legacy_has_resume = (
-                isinstance(command_input, dict)
-                and 'resume' in command_input
-                and legacy_command_resume is not None
-            )
-            agui_resume = list(input.resume) if input.resume else None
-            if agui_resume is not None and legacy_has_resume:
-                logger.warning(
-                    "both input.resume and forwardedProps.command.resume were provided; "
-                    "input.resume wins (thread_id=%r, run_id=%r)",
-                    thread_id, self.active_run.get("id"),
-                )
-            if legacy_has_resume and agui_resume is None:
-                logger.warning(
-                    "forwardedProps.command.resume is deprecated; please send "
-                    "RunAgentInput.resume[] (thread_id=%r, run_id=%r)",
-                    thread_id, self.active_run.get("id"),
-                )
-            # Truthiness, not `is not None`: an empty resume list means "no
-            # resume" (consistent with treating an absent resume as no-resume),
-            # so it must not suppress the regenerate / interrupt paths.
-            has_resume_input = bool(agui_resume) or legacy_has_resume
+            # An explicitly-present list, including [], is a resume attempt.
+            # Strict validation in prepare_stream either accepts the complete
+            # current interrupt set or terminates with RUN_ERROR.
+            has_resume_input = input.resume is not None or legacy_resume_requested
             # active_run was just reset to INITIAL_ACTIVE_RUN above, so
             # active_run["node_name"] is always None here — the else branch
             # was dead code. Resolve to None directly to make the intent
@@ -511,30 +484,42 @@ class LangGraphAgent:
         interrupts = self._collect_interrupts(agent_state.tasks)
         has_active_interrupts = len(interrupts) > 0
 
-        # AG-UI standard: RunAgentInput.resume = [ResumeEntry, ...]
-        agui_resume: Optional[list] = list(input.resume) if input.resume else None
+        # AG-UI standard: the only accepted resume channel is
+        # RunAgentInput.resume = [ResumeEntry, ...]. An explicitly-present empty
+        # list is a resume request and fails the exact-set check below.
+        agui_resume = input.resume
+        resume_requested = agui_resume is not None
 
-        # Legacy fallback: forwardedProps.command.resume (LangGraph private).
-        # The conflict / deprecation warnings are emitted once in ``run`` (the
-        # request entry point); ``prepare_stream`` only needs the values to
-        # construct the LangGraph Command and stays silent to avoid the
-        # duplicate-log issue the reviewer flagged.
+        # The old forwardedProps.command.resume channel is rejected, including
+        # falsy values and requests that also carry the standard resume array.
         command_input = forwarded_props.get('command', {})
-        legacy_command_resume = (
-            command_input.get('resume', None) if isinstance(command_input, dict) else None
+        legacy_resume_requested = (
+            isinstance(command_input, dict) and 'resume' in command_input
         )
-        legacy_has_resume = (
-            isinstance(command_input, dict)
-            and 'resume' in command_input
-            and legacy_command_resume is not None
-        )
-
-        # Truthiness, not `is not None`: an empty resume list means "no resume"
-        # (consistent with treating an absent resume as no-resume), so it must
-        # not suppress the regenerate / interrupt paths.
-        has_resume_input = bool(agui_resume) or legacy_has_resume
+        has_resume_input = resume_requested or legacy_resume_requested
 
         self.active_run["schema_keys"] = self.get_schema_keys(config)
+
+        if legacy_resume_requested:
+            return self._invalid_resume_response(
+                "Invalid resume request: forwardedProps.command.resume is not supported; "
+                "use RunAgentInput.resume[]."
+            )
+
+        agui_interrupts: Optional[List[AGUIInterrupt]] = None
+        if resume_requested:
+            try:
+                agui_interrupts = self._interrupts_to_agui(interrupts)
+            except (TypeError, ValueError) as exc:
+                return self._invalid_resume_response(
+                    f"Invalid resume request: current interrupt set is malformed ({exc})."
+                )
+            validation_error = self._validate_resume_entries(
+                agui_resume,
+                open_interrupts=agui_interrupts,
+            )
+            if validation_error is not None:
+                return self._invalid_resume_response(validation_error)
 
         # Interrupt resume must be checked BEFORE the regenerate heuristic.
         # When an interrupt is active the checkpoint contains an AI message
@@ -622,27 +607,9 @@ class LangGraphAgent:
             await self.graph.aupdate_state(config, state, as_node=self.active_run.get("node_name"))
 
         if has_resume_input:
-            if agui_resume is not None:
-                stream_input = self._build_command_from_agui_resume(
-                    agui_resume,
-                    open_interrupts=self._interrupts_to_agui(interrupts),
-                )
-            else:
-                resume_payload = legacy_command_resume
-                if isinstance(resume_payload, str):
-                    raw_resume = resume_payload
-                    try:
-                        resume_payload = json.loads(raw_resume)
-                    except json.JSONDecodeError as exc:
-                        logger.warning(
-                            "failed to parse legacy resume_input as JSON, treating as string "
-                            "(thread_id=%r, run_id=%r, error=%s): %r",
-                            thread_id,
-                            self.active_run.get("id"),
-                            exc,
-                            raw_resume[:200],
-                        )
-                stream_input = Command(resume=resume_payload)
+            # The validation above guarantees a concrete list whose IDs match
+            # every currently-open interrupt exactly.
+            stream_input = self._build_command_from_agui_resume(agui_resume)
         else:
             payload_input = get_stream_payload_input(
                 mode=self.active_run["mode"],
@@ -1101,58 +1068,19 @@ class LangGraphAgent:
         run_id: str,
         lg_interrupts: list,
     ) -> List[ProcessedEvents]:
-        """Build the tail-events for an interrupt-terminated run.
-
-        Default (``emit_interrupt_outcome=False``, ``enable_legacy_on_interrupt_event=True``):
-          [CustomEvent(on_interrupt) * N, RunFinishedEvent]            # plain finish, no outcome
-        Opt-in (``emit_interrupt_outcome=True``):
-          [CustomEvent(on_interrupt) * N, RunFinishedEvent(outcome=Interrupt)]
-
-        ``emit_interrupt_outcome`` defaults to False: released clients that
-        resume via the legacy ``forwardedProps.command.resume`` channel stop
-        sending a resume directive once they observe the structured outcome,
-        which strands the run. It stays opt-in until those clients adopt
-        ``RunAgentInput.resume[]``.
-
-        The structured outcome is, however, emitted whenever the legacy
-        on_interrupt event is disabled (``enable_legacy_on_interrupt_event=False``),
-        even if ``emit_interrupt_outcome`` is False — otherwise the interrupt
-        would be surfaced by neither channel and silently swallowed.
-
-        Caller is responsible for any preceding STATE_SNAPSHOT / MESSAGES_SNAPSHOT.
-        """
+        """Build the standard tail event for an interrupt-terminated run."""
         agui_interrupts = self._interrupts_to_agui(lg_interrupts)
-        events: List[ProcessedEvents] = []
-        if self.enable_legacy_on_interrupt_event:
-            for raw, mapped in zip(lg_interrupts, agui_interrupts):
-                events.append(
-                    CustomEvent(
-                        type=EventType.CUSTOM,
-                        name=LangGraphEventTypes.OnInterrupt.value,
-                        value=dump_json_safe(raw.value),
-                        raw_event=raw,
-                    )
-                )
-        # Emit the structured outcome when opted in, OR whenever the legacy
-        # on_interrupt event is disabled — otherwise the interrupt would be
-        # surfaced by neither channel and silently swallowed.
-        include_outcome = (
-            self.emit_interrupt_outcome or not self.enable_legacy_on_interrupt_event
-        )
-        outcome = (
-            RunFinishedInterruptOutcome(type="interrupt", interrupts=agui_interrupts)
-            if include_outcome
-            else None
-        )
-        events.append(
+        return [
             RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id,
-                outcome=outcome,
+                outcome=RunFinishedInterruptOutcome(
+                    type="interrupt",
+                    interrupts=agui_interrupts,
+                ),
             )
-        )
-        return events
+        ]
 
     def _emit_success_finish(
         self, *, thread_id: str, run_id: str
@@ -1167,40 +1095,63 @@ class LangGraphAgent:
     def _build_command_from_agui_resume(
         self,
         entries: list,
-        *,
-        open_interrupts: Optional[List[AGUIInterrupt]] = None,
     ) -> Command:
-        """Convert AG-UI ResumeEntry[] into LangGraph Command(resume=...).
+        """Build one native LangGraph command keyed by interrupt ID."""
+        return Command(resume={entry.interrupt_id: entry.payload for entry in entries})
 
-        ``open_interrupts`` is the list of currently-pending AG-UI
-        Interrupts on the thread (already mapped via the hook above).
-        Subclasses may use it to align resume entries with the
-        framework-native action order.
+    @staticmethod
+    def _invalid_resume_response(message: str) -> PreparedStream:
+        return {
+            "stream": None,
+            "state": None,
+            "config": None,
+            "events_to_dispatch": [
+                RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    code="INVALID_RESUME",
+                    message=message,
+                )
+            ],
+        }
 
-        Default implementation: single-resolved → payload, single-cancelled
-        → sentinel dict, multiple → __agui_resume_map__ sentinel.
-        """
-        if len(entries) == 1:
-            e = entries[0]
-            if e.status == "resolved":
-                return Command(resume=e.payload)
-            return Command(
-                resume={
-                    DEFAULT_RESUME_SENTINEL_CANCELLED: True,
-                    "interrupt_id": e.interrupt_id,
-                }
+    @staticmethod
+    def _validate_resume_entries(
+        entries: Any,
+        *,
+        open_interrupts: List[AGUIInterrupt],
+    ) -> Optional[str]:
+        """Validate one response for every currently-open interrupt."""
+        if not isinstance(entries, list):
+            return "Invalid resume request: resume must be an array."
+
+        open_ids = [interrupt.id for interrupt in open_interrupts]
+        if any(not isinstance(interrupt_id, str) or not interrupt_id for interrupt_id in open_ids):
+            return "Invalid resume request: current interrupt set contains a malformed ID."
+        if len(open_ids) != len(set(open_ids)):
+            return "Invalid resume request: current interrupt set contains duplicate IDs."
+        if not open_ids:
+            return "Invalid resume request: there are no open interrupts to resume."
+
+        resume_ids = []
+        for entry in entries:
+            if not isinstance(entry, ResumeEntry):
+                return "Invalid resume request: every entry must be a ResumeEntry."
+            interrupt_id = getattr(entry, "interrupt_id", None)
+            status = getattr(entry, "status", None)
+            if not isinstance(interrupt_id, str) or not interrupt_id:
+                return "Invalid resume request: every entry must have a non-empty interruptId."
+            if status not in ("resolved", "cancelled"):
+                return "Invalid resume request: every entry must have a valid status."
+            resume_ids.append(interrupt_id)
+
+        if len(resume_ids) != len(set(resume_ids)):
+            return "Invalid resume request: duplicate interruptId values are not allowed."
+        if len(resume_ids) != len(open_ids) or set(resume_ids) != set(open_ids):
+            return (
+                "Invalid resume request: responses must match the exact set and count "
+                "of currently-open interrupts."
             )
-        return Command(
-            resume={
-                DEFAULT_RESUME_SENTINEL_MAP: {
-                    e.interrupt_id: {
-                        "status": e.status,
-                        "payload": e.payload,
-                    }
-                    for e in entries
-                }
-            }
-        )
+        return None
 
     def get_capabilities(self) -> dict:
         """Return the agent's capability declaration.
