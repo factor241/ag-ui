@@ -74,6 +74,25 @@ class TestEmitInterruptFinish(unittest.TestCase):
             ["int-1", "int-2"],
         )
 
+    def test_deprecated_flags_cannot_disable_standard_outcome(self):
+        with self.assertWarns(DeprecationWarning):
+            agent = LangGraphAgent(
+                name="test",
+                graph=MagicMock(),
+                enable_legacy_on_interrupt_event=True,
+                emit_interrupt_outcome=False,
+            )
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=[FakeInterrupt(value="confirm", id="int-1")],
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], RunFinishedEvent)
+        self.assertEqual(events[0].outcome.type, "interrupt")
+
 
 class TestInterruptMappingHardening(unittest.TestCase):
     def test_missing_langgraph_id_raises(self):

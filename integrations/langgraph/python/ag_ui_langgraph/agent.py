@@ -1,8 +1,12 @@
+import asyncio
 import logging
 import re
 import uuid
 import json
+import warnings
+from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Optional, List, Any, Union, AsyncGenerator, Generator, Literal, Dict, TypedDict
 from typing_extensions import NotRequired, Self
 import inspect
@@ -76,7 +80,6 @@ from ag_ui.core import (
     ReasoningEncryptedValueEvent,
 )
 from .interrupts import lg_interrupts_to_agui
-from ag_ui.encoder import EventEncoder
 from ag_ui_a2ui_toolkit import split_a2ui_schema_context
 
 ProcessedEvents = Union[
@@ -109,6 +112,43 @@ logger = logging.getLogger(__name__)
 ROOT_SUBGRAPH_NAME = "root"
 
 
+class _ThreadLockRecord:
+    """One in-process thread lock plus its current owner/waiter count."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+class _ThreadLockRegistry:
+    """Serialize graph runs for one thread inside a single Python process.
+
+    This is deliberately an in-memory process boundary, not a distributed
+    compare-and-swap. Multi-worker deployments need a durable coordination
+    layer owned by their checkpoint/runtime architecture.
+    """
+
+    def __init__(self) -> None:
+        self._records: Dict[str, _ThreadLockRecord] = {}
+
+    @asynccontextmanager
+    async def hold(self, thread_id: str):
+        # No await occurs between lookup and increment, so asyncio tasks on the
+        # same event loop cannot lose a registry update here.
+        record = self._records.get(thread_id)
+        if record is None:
+            record = _ThreadLockRecord()
+            self._records[thread_id] = record
+        record.users += 1
+        try:
+            async with record.lock:
+                yield
+        finally:
+            record.users -= 1
+            if record.users == 0 and self._records.get(thread_id) is record:
+                del self._records[thread_id]
+
+
 class PreparedStream(TypedDict):
     """Payload returned by prepare_stream / prepare_regenerate_stream.
 
@@ -124,7 +164,16 @@ class PreparedStream(TypedDict):
     events_to_dispatch: NotRequired[Optional[List[ProcessedEvents]]]
 
 class LangGraphAgent:
-    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None):
+    def __init__(
+        self,
+        *,
+        name: str,
+        graph: CompiledStateGraph,
+        description: Optional[str] = None,
+        config: Union[Optional[RunnableConfig], dict] = None,
+        enable_legacy_on_interrupt_event: Optional[bool] = None,
+        emit_interrupt_outcome: Optional[bool] = None,
+    ):
         self.name = name
         self.description = description
         self.graph = graph
@@ -141,6 +190,23 @@ class LangGraphAgent:
             if isinstance(getattr(node, 'bound', None), CompiledStateGraph)
         }
         self.current_subgraph = ROOT_SUBGRAPH_NAME
+        self._thread_lock_registry = _ThreadLockRegistry()
+
+        if (
+            enable_legacy_on_interrupt_event is not None
+            or emit_interrupt_outcome is not None
+        ):
+            warnings.warn(
+                "enable_legacy_on_interrupt_event and emit_interrupt_outcome "
+                "are deprecated compatibility arguments; LangGraphAgent always "
+                "emits the standard interrupt outcome and never emits the legacy "
+                "on_interrupt event.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        # Keep readable compatibility attributes while standardizing behavior.
+        self.enable_legacy_on_interrupt_event = False
+        self.emit_interrupt_outcome = True
 
     def clone(self) -> Self:
         """Create a fresh copy with clean per-request state.
@@ -149,11 +215,11 @@ class LangGraphAgent:
         to pass those parameters through.
         """
         try:
-            return type(self)(
+            cloned = type(self)(
                 name=self.name,
                 graph=self.graph,
                 description=self.description,
-                config=dict(self.config) if self.config else None,
+                config=deepcopy(self.config) if self.config else None,
             )
         except TypeError as exc:
             raise TypeError(
@@ -161,6 +227,10 @@ class LangGraphAgent:
                 f"__init__ accepts (name, graph, description, config) as "
                 f"keyword arguments: {exc}"
             ) from exc
+        # Clones isolate request state and nested configuration, but they must
+        # share the template's lock registry to serialize the same thread.
+        cloned._thread_lock_registry = self._thread_lock_registry
+        return cloned
 
     def _dispatch_event(self, event: ProcessedEvents) -> ProcessedEvents:
         if event.type == EventType.RAW:
@@ -180,8 +250,19 @@ class LangGraphAgent:
             forwarded_props = {
                 camel_to_snake(k): v for k, v in input.forwarded_props.items()
             }
-        async for event_str in self._handle_stream_events(input.model_copy(update={"forwarded_props": forwarded_props})):
-            yield event_str
+        thread_id = input.thread_id or str(uuid.uuid4())
+        normalized_input = input.model_copy(
+            update={
+                "forwarded_props": forwarded_props,
+                "thread_id": thread_id,
+            }
+        )
+        # Hold through checkpoint re-read, resume validation, graph dispatch,
+        # and complete stream consumption. A concurrent loser then observes the
+        # winner's closed checkpoint and fails strict resume validation.
+        async with self._thread_lock_registry.hold(thread_id):
+            async for event_str in self._handle_stream_events(normalized_input):
+                yield event_str
 
     async def _handle_stream_events(self, input: RunAgentInput) -> AsyncGenerator[ProcessedEvents, None]:
         thread_id = input.thread_id or str(uuid.uuid4())
@@ -1132,6 +1213,27 @@ class LangGraphAgent:
         if not open_ids:
             return "Invalid resume request: there are no open interrupts to resume."
 
+        now = datetime.now(timezone.utc)
+        for interrupt in open_interrupts:
+            expires_at = interrupt.expires_at
+            if expires_at is None:
+                continue
+            if not isinstance(expires_at, str) or not expires_at:
+                return "Invalid resume request: current interrupt has a malformed expiresAt."
+            normalized_expiry = (
+                f"{expires_at[:-1]}+00:00"
+                if expires_at.endswith(("Z", "z"))
+                else expires_at
+            )
+            try:
+                expiry = datetime.fromisoformat(normalized_expiry)
+            except ValueError:
+                return "Invalid resume request: current interrupt has a malformed expiresAt."
+            if expiry.tzinfo is None or expiry.utcoffset() is None:
+                return "Invalid resume request: current interrupt expiresAt must include a UTC offset."
+            if expiry.astimezone(timezone.utc) <= now:
+                return "Invalid resume request: current interrupt has expired."
+
         resume_ids = []
         for entry in entries:
             if not isinstance(entry, ResumeEntry):
@@ -1142,6 +1244,8 @@ class LangGraphAgent:
                 return "Invalid resume request: every entry must have a non-empty interruptId."
             if status not in ("resolved", "cancelled"):
                 return "Invalid resume request: every entry must have a valid status."
+            if status == "cancelled" and getattr(entry, "payload", None) is not None:
+                return "Invalid resume request: cancelled entries must have a null payload."
             resume_ids.append(interrupt_id)
 
         if len(resume_ids) != len(set(resume_ids)):

@@ -1,6 +1,7 @@
 """Tests for LangGraphAgent.clone() subclass preservation."""
 
 import unittest
+import warnings
 from unittest.mock import MagicMock
 
 from ag_ui_langgraph import LangGraphAgent
@@ -54,13 +55,21 @@ class TestClone(unittest.TestCase):
         self.assertEqual(cloned.description, "A test agent")
         self.assertEqual(cloned.config, config)
 
-    def test_clone_shallow_copies_config(self):
-        """clone() should shallow-copy config so mutations don't leak."""
-        config = {"recursion_limit": 50}
+    def test_clone_deep_copies_nested_config(self):
+        """clone() should isolate nested config mutations across requests."""
+        config = {
+            "recursion_limit": 50,
+            "configurable": {"request_context": {"actor": "template"}},
+        }
         agent = LangGraphAgent(name="test", graph=self._make_graph(), config=config)
-        cloned = agent.clone()
-        self.assertEqual(cloned.config, config)
-        self.assertIsNot(cloned.config, agent.config)
+        first = agent.clone()
+        second = agent.clone()
+
+        first.config["configurable"]["request_context"]["actor"] = "request-1"
+
+        self.assertEqual(agent.config["configurable"]["request_context"]["actor"], "template")
+        self.assertEqual(second.config["configurable"]["request_context"]["actor"], "template")
+        self.assertIsNot(first.config["configurable"], agent.config["configurable"])
 
     def test_clone_subclass_has_overridden_methods(self):
         """clone() of a subclass should have the subclass's methods."""
@@ -99,6 +108,26 @@ class TestClone(unittest.TestCase):
         cloned = agent.clone()
         self.assertIsNot(agent, cloned)
         self.assertIsNot(agent.messages_in_process, cloned.messages_in_process)
+
+    def test_deprecated_interrupt_flags_are_accepted_but_standardized(self):
+        graph = self._make_graph()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            agent = LangGraphAgent(
+                name="test",
+                graph=graph,
+                enable_legacy_on_interrupt_event=True,
+                emit_interrupt_outcome=False,
+            )
+
+        self.assertFalse(agent.enable_legacy_on_interrupt_event)
+        self.assertTrue(agent.emit_interrupt_outcome)
+        self.assertTrue(any(item.category is DeprecationWarning for item in caught))
+
+        cloned = agent.clone()
+        self.assertFalse(cloned.enable_legacy_on_interrupt_event)
+        self.assertTrue(cloned.emit_interrupt_outcome)
 
 
 if __name__ == "__main__":

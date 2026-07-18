@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, List
 from unittest.mock import MagicMock
 
@@ -49,6 +50,25 @@ def _state(*interrupt_ids: str):
     ]
     state.next = []
     state.metadata = {"writes": {}}
+    return state
+
+
+def _state_with_expiry(expires_at: str):
+    state = _state()
+    state.tasks = [
+        FakeTask(
+            interrupts=[
+                FakeInterrupt(
+                    value={
+                        "reason": "confirmation",
+                        "message": "int-1",
+                        "expiresAt": expires_at,
+                    },
+                    id="int-1",
+                )
+            ]
+        )
+    ]
     return state
 
 
@@ -133,6 +153,74 @@ class TestStrictResumeContract(unittest.IsolatedAsyncioTestCase):
 
         command = agent.graph.astream_events.call_args.kwargs["input"]
         self.assertEqual(command.resume, {"int-1": None})
+
+    async def test_cancelled_entry_rejects_every_non_null_payload(self):
+        for payload in (False, 0, "", {}, [], True):
+            with self.subTest(payload=payload):
+                agent = make_agent()
+                resume = [
+                    ResumeEntry(
+                        interrupt_id="int-1",
+                        status="cancelled",
+                        payload=payload,
+                    ),
+                ]
+
+                result = await _prepare(agent, _state("int-1"), _input(resume=resume))
+
+                self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
+                agent.graph.astream_events.assert_not_called()
+
+    async def test_resume_before_utc_expiry_is_accepted(self):
+        agent = make_agent()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload=True)]
+
+        result = await _prepare(
+            agent,
+            _state_with_expiry(expires_at),
+            _input(resume=resume),
+        )
+
+        self.assertIsNotNone(result["stream"])
+        agent.graph.astream_events.assert_called_once()
+
+    async def test_expired_or_equal_utc_expiry_fails_closed(self):
+        for expires_at in (
+            (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+            datetime.now(timezone.utc).isoformat(),
+        ):
+            with self.subTest(expires_at=expires_at):
+                agent = make_agent()
+                resume = [
+                    ResumeEntry(interrupt_id="int-1", status="resolved", payload=True)
+                ]
+
+                result = await _prepare(
+                    agent,
+                    _state_with_expiry(expires_at),
+                    _input(resume=resume),
+                )
+
+                self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
+                agent.graph.astream_events.assert_not_called()
+
+    async def test_malformed_or_naive_expiry_fails_closed(self):
+        for expires_at in ("not-a-timestamp", "2030-01-01T00:00:00"):
+            with self.subTest(expires_at=expires_at):
+                agent = make_agent()
+                resume = [
+                    ResumeEntry(interrupt_id="int-1", status="resolved", payload=True)
+                ]
+
+                result = await _prepare(
+                    agent,
+                    _state_with_expiry(expires_at),
+                    _input(resume=resume),
+                )
+
+                self.assertEqual(_event_types(result), [EventType.RUN_ERROR])
+                agent.graph.astream_events.assert_not_called()
 
     async def test_partial_resume_is_run_error_without_graph_dispatch(self):
         agent = make_agent()

@@ -43,7 +43,12 @@ FastAPI evaluates `dependencies` before the handler can clone or run the
 agent. After the dependency gate succeeds, the registrar creates a
 request-local agent clone and calls
 `before_dispatch(input, request, request_agent)` before `request_agent.run`.
-The hook may be synchronous or asynchronous.
+The hook may be synchronous or asynchronous; its return value is ignored.
+
+If the body contains a malformed `resume` value (for example, a non-array,
+an invalid status, or an entry without `interruptId`), the endpoint returns a
+standard `RUN_ERROR` SSE without cloning or running the agent. Validation
+errors in unrelated request fields keep FastAPI's normal `422` response.
 
 ## Features
 
@@ -79,7 +84,11 @@ every interrupt in the latest open interrupt outcome:
 input = RunAgentInput(
     thread_id="t1",
     run_id="r2",
+    state={},
     messages=[],
+    tools=[],
+    context=[],
+    forwarded_props={},
     resume=[
         ResumeEntry(
             interrupt_id="int-abc",
@@ -96,6 +105,24 @@ empty, and mixed resume arrays terminate with standard `RUN_ERROR` and do not
 dispatch the graph. `forwardedProps.command.resume` is rejected. A valid full
 set becomes one native LangGraph `Command(resume={interrupt_id: payload, ...})`
 and is dispatched exactly once.
+
+An interrupt with `expiresAt` can be resumed only before that timezone-aware
+ISO-8601 timestamp. Expired or malformed timestamps fail closed. A
+`status="cancelled"` entry must omit `payload` or set it to `None`; every
+non-null payload, including falsey values, is rejected.
+
+Clones created from the same agent template share a per-thread `asyncio` lock.
+The lock covers checkpoint re-read, validation, graph dispatch, and complete
+stream consumption, so two concurrent resumes in one FastAPI backend process
+cannot both execute. This guarantee is deliberately process-local; deployments
+with multiple workers or hosts require durable cross-process coordination in
+their checkpoint/runtime layer.
+
+The deprecated constructor arguments `enable_legacy_on_interrupt_event` and
+`emit_interrupt_outcome` remain accepted for source compatibility and emit a
+`DeprecationWarning`, but their values are ignored. The adapter always emits
+the standard interrupt outcome and never emits the legacy `on_interrupt`
+custom event.
 
 ### Capabilities
 
