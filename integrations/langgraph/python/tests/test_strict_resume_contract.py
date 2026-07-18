@@ -4,12 +4,12 @@ import unittest
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
-from ag_ui.core import CustomEvent, EventType, ResumeEntry, UserMessage
+from ag_ui.core import CustomEvent, EventType, ResumeEntry, RunAgentInput, UserMessage
 from ag_ui_langgraph.agent import _ResumeClaimRegistry
 
 from tests._helpers import make_agent
@@ -100,6 +100,48 @@ def _event_types(result):
 
 
 class TestStrictResumeContract(unittest.IsolatedAsyncioTestCase):
+    async def test_error_stream_keeps_claim_even_if_checkpoint_looks_closed(self):
+        agent = make_agent()
+        initial_state = _state("int-1")
+        terminal_looking_state = _state()
+        agent.graph.aget_state = AsyncMock(
+            side_effect=[initial_state, terminal_looking_state]
+        )
+
+        async def error_stream():
+            yield {"event": "error", "data": {"message": "uncertain failure"}}
+
+        agent.graph.astream_events = MagicMock(
+            side_effect=lambda **kwargs: error_stream()
+        )
+
+        async def no_snapshots(config):
+            if False:
+                yield None
+
+        agent.get_state_and_messages_snapshots = no_snapshots
+        input_data = RunAgentInput(
+            thread_id="thread-1",
+            run_id="run-1",
+            state={},
+            messages=[],
+            tools=[],
+            context=[],
+            forwarded_props={},
+            resume=[
+                ResumeEntry(
+                    interrupt_id="int-1",
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        )
+
+        events = [event async for event in agent.run(input_data)]
+
+        self.assertIn(EventType.RUN_ERROR, [event.type for event in events])
+        self.assertEqual(len(agent._resume_claim_registry), 1)
+
     async def test_interrupted_run_uses_only_standard_outcome_with_all_open_interrupts(self):
         agent = make_agent()
 

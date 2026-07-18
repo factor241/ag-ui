@@ -134,6 +134,12 @@ same thread safely retires its older claim. The LRU-ordered registry is bounded
 at 4096 live claims; if claims from other still-current threads fill it, new
 resumes fail closed rather than evicting replay protection.
 
+A claim is also retired after the stream exhausts normally and a fresh
+checkpoint read verifies terminal closure (`next` is empty and there are no
+open interrupts). This frees capacity used by successfully completed threads.
+Stream errors, exceptions, cancellation, disconnect, open interrupts, or a
+non-terminal checkpoint never trigger this retirement.
+
 The guarantee covers one FastAPI async worker/event loop. Process restart clears
 in-memory claims, and multiple workers, event loops, or hosts do not share them;
 those deployments require a durable atomic claim/CAS in their shared

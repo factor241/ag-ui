@@ -15,15 +15,21 @@ from httpx import ASGITransport, AsyncClient
 
 from ag_ui.core import EventType, ResumeEntry, RunAgentInput
 from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
+from ag_ui_langgraph.agent import _ResumeClaimRegistry
 
 
 class ApprovalState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-def _resume_input(*, run_id: str, interrupt_id: str) -> RunAgentInput:
+def _resume_input(
+    *,
+    run_id: str,
+    interrupt_id: str,
+    thread_id: str = "shared-thread",
+) -> RunAgentInput:
     return RunAgentInput(
-        thread_id="shared-thread",
+        thread_id=thread_id,
         run_id=run_id,
         state={},
         messages=[],
@@ -147,6 +153,70 @@ async def _make_side_effect_blocked_graph():
 
 
 class TestConcurrentResumeLock(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_terminal_closure_retires_claim_capacity(self):
+        side_effects = []
+
+        async def approval_node(state):
+            answer = interrupt(
+                {"reason": "confirmation", "message": "Approve this action?"}
+            )
+            side_effects.append(answer)
+            return {}
+
+        builder = StateGraph(ApprovalState)
+        builder.add_node("approval", approval_node)
+        builder.add_edge(START, "approval")
+        builder.add_edge("approval", END)
+        graph = builder.compile(checkpointer=InMemorySaver())
+        configs = {
+            thread_id: {"configurable": {"thread_id": thread_id}}
+            for thread_id in ("thread-a", "thread-b")
+        }
+        interrupt_ids = {}
+        for thread_id, config in configs.items():
+            await graph.ainvoke({"messages": []}, config)
+            checkpoint = await graph.aget_state(config)
+            interrupt_ids[thread_id] = checkpoint.tasks[0].interrupts[0].id
+
+        dispatches = 0
+        original_astream_events = graph.astream_events
+
+        def counted_astream_events(*args, **kwargs):
+            nonlocal dispatches
+            dispatches += 1
+            return original_astream_events(*args, **kwargs)
+
+        graph.astream_events = counted_astream_events
+        template = LangGraphAgent(name="approval", graph=graph)
+        template._resume_claim_registry = _ResumeClaimRegistry(max_claims=1)
+
+        async def resume(thread_id):
+            agent = template.clone()
+            return [
+                event
+                async for event in agent.run(
+                    _resume_input(
+                        run_id=f"run-{thread_id}",
+                        interrupt_id=interrupt_ids[thread_id],
+                        thread_id=thread_id,
+                    )
+                )
+            ]
+
+        first_events = await resume("thread-a")
+        closed_state = await graph.aget_state(configs["thread-a"])
+
+        self.assertIn(EventType.RUN_FINISHED, [event.type for event in first_events])
+        self.assertFalse(any(task.interrupts for task in closed_state.tasks))
+        self.assertEqual(len(template._resume_claim_registry), 0)
+
+        second_events = await resume("thread-b")
+
+        self.assertIn(EventType.RUN_FINISHED, [event.type for event in second_events])
+        self.assertNotIn(EventType.RUN_ERROR, [event.type for event in second_events])
+        self.assertEqual(dispatches, 2)
+        self.assertEqual(len(side_effects), 2)
+
     async def test_two_clones_resume_one_real_checkpoint_exactly_once(self):
         graph, interrupt_id, side_effects, metrics = await _make_paused_graph()
 

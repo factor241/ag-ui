@@ -39,6 +39,12 @@ class TestDocumentationContract(unittest.TestCase):
         )
         self.assertIn("one FastAPI async worker/event loop", normalized)
         self.assertIn("durable atomic claim/CAS", normalized)
+        self.assertIn("fresh checkpoint read verifies terminal closure", normalized)
+        self.assertIn("successfully completed threads", normalized)
+        self.assertIn(
+            "errors, exceptions, cancellation, disconnect, open interrupts",
+            normalized,
+        )
 
 
 if __name__ == "__main__":

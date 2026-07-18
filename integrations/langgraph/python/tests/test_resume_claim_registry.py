@@ -30,6 +30,16 @@ class TestResumeClaimRegistry(unittest.TestCase):
         self.assertEqual(registry.try_claim(overflow).value, "capacity_exceeded")
         self.assertEqual(len(registry), 2)
 
+    def test_verified_terminal_retirement_removes_only_exact_claim(self):
+        registry_type = getattr(agent_module, "_ResumeClaimRegistry", None)
+        registry = registry_type(max_claims=1)
+        fingerprint = ("thread-1", "checkpoint-1", ("interrupt-1",))
+
+        self.assertEqual(registry.try_claim(fingerprint).value, "claimed")
+        self.assertTrue(registry.retire_verified_closed(fingerprint))
+        self.assertEqual(len(registry), 0)
+        self.assertFalse(registry.retire_verified_closed(fingerprint))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -244,6 +244,14 @@ class _ResumeClaimRegistry:
             self._claims[fingerprint] = None
             return _ResumeClaimStatus.CLAIMED
 
+    def retire_verified_closed(self, fingerprint: _ResumeFingerprint) -> bool:
+        """Retire exactly one claim after a confirmed terminal checkpoint."""
+        with self._guard:
+            if fingerprint not in self._claims:
+                return False
+            del self._claims[fingerprint]
+            return True
+
 
 class PreparedStream(TypedDict):
     """Payload returned by prepare_stream / prepare_regenerate_stream.
@@ -288,6 +296,7 @@ class LangGraphAgent:
         self.current_subgraph = ROOT_SUBGRAPH_NAME
         self._thread_lock_registry = _ThreadLockRegistry()
         self._resume_claim_registry = _ResumeClaimRegistry()
+        self._active_resume_claim: Optional[_ResumeFingerprint] = None
 
         if (
             enable_legacy_on_interrupt_event is not None
@@ -377,6 +386,7 @@ class LangGraphAgent:
             "state_reliable": True,
         }
         self.active_run = INITIAL_ACTIVE_RUN
+        self._active_resume_claim = None
         try:
 
             forwarded_props = input.forwarded_props
@@ -440,6 +450,7 @@ class LangGraphAgent:
 
             should_exit = False
             current_graph_state = state
+            stream_failed = False
 
             async for event in stream:
                 subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs', True) if input.forwarded_props else True
@@ -470,6 +481,7 @@ class LangGraphAgent:
                         yield ev
 
                 if event["event"] == "error":
+                    stream_failed = True
                     # Upstream "error" events do not always carry a
                     # data.message field; a hard subscript here crashed
                     # the error path itself. Fall back to a generic
@@ -618,6 +630,20 @@ class LangGraphAgent:
             next_nodes = state.next or ()
             is_end_node = len(next_nodes) == 0 and not interrupts
 
+            # Only normal stream exhaustion followed by a checkpoint re-read
+            # proving terminal closure can retire replay protection. Error,
+            # cancellation/disconnect, open interrupts, and non-terminal next
+            # nodes keep the claim fail-closed.
+            if (
+                not stream_failed
+                and is_end_node
+                and self._active_resume_claim is not None
+            ):
+                self._resume_claim_registry.retire_verified_closed(
+                    self._active_resume_claim
+                )
+                self._active_resume_claim = None
+
             node_name = "__end__" if is_end_node else node_name
 
             if self.active_run.get("node_name") != node_name:
@@ -646,6 +672,7 @@ class LangGraphAgent:
                 )
         finally:
             self.active_run = None
+            self._active_resume_claim = None
 
     async def prepare_stream(self, input: RunAgentInput, agent_state: State, config: RunnableConfig) -> PreparedStream:
         # Invariant: prepare_stream is only called from _handle_stream_events
@@ -716,6 +743,7 @@ class LangGraphAgent:
                     "Invalid resume request: process-local resume claim capacity "
                     "is exhausted; refusing dispatch fail-closed."
                 )
+            self._active_resume_claim = fingerprint
 
         # Interrupt resume must be checked BEFORE the regenerate heuristic.
         # When an interrupt is active the checkpoint contains an AI message
